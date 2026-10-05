@@ -1,0 +1,9 @@
+# Licensed typefaces never leave the machine; every page names Helvetica
+# Neue and takes the reader's own copy.
+fonts/
+*.otf
+*.ttf
+*.woff
+*.woff2
+*.psd
+.DS_Store

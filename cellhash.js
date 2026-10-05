@@ -1,0 +1,438 @@
+/* Signature fields — the generator applied to print, and the live editing that
+   drives it. The generator itself is in the guidelines (§08); this is the same
+   pipeline bound to the pieces. Originally the Lab's "Your Mark".
+
+   cyrb128 hashes the holder's name to 128 bits,
+   and an sfc32 stream then lays out every cell in reading order. The same name
+   always produces the same field, so a mark generated in the Lab and a mark
+   printed on a card are the same artwork.
+
+   Output is inline SVG rather than canvas. The PDF export clones the artifact
+   and hands it to the browser's print pipeline, where only real paths survive
+   as vector — a canvas would land in Illustrator as a flat bitmap, which is
+   the failure §02 warns about. */
+(() => {
+  'use strict';
+
+  /* cyrb128 / sfc32, unchanged from lab.js. Any edit here breaks parity with
+     the Lab tool, which is the whole point of using them. */
+  function cyrb128(str) {
+    let h1 = 1779033703, h2 = 3144134277, h3 = 1013904242, h4 = 2773480762;
+    for (let i = 0, k; i < str.length; i++) {
+      k = str.charCodeAt(i);
+      h1 = h2 ^ Math.imul(h1 ^ k, 597399067);
+      h2 = h3 ^ Math.imul(h2 ^ k, 2869860233);
+      h3 = h4 ^ Math.imul(h3 ^ k, 951274213);
+      h4 = h1 ^ Math.imul(h4 ^ k, 2716044179);
+    }
+    h1 = Math.imul(h3 ^ (h1 >>> 18), 597399067);
+    h2 = Math.imul(h4 ^ (h2 >>> 22), 2869860233);
+    h3 = Math.imul(h1 ^ (h3 >>> 17), 951274213);
+    h4 = Math.imul(h2 ^ (h4 >>> 19), 2716044179);
+    return [(h1 ^ h2 ^ h3 ^ h4) >>> 0, (h2 ^ h1) >>> 0, (h3 ^ h1) >>> 0, (h4 ^ h1) >>> 0];
+  }
+  function sfc32(a, b, c, d) {
+    return function () {
+      a >>>= 0; b >>>= 0; c >>>= 0; d >>>= 0;
+      let t = (a + b) | 0;
+      a = b ^ b >>> 9; b = c + (c << 3) | 0; c = (c << 21 | c >>> 11); d = d + 1 | 0;
+      t = t + d | 0; c = c + t | 0;
+      return (t >>> 0) / 4294967296;
+    };
+  }
+
+  /* The four families at their print values, each with its own gradient
+     direction from §02. The Lab runs every gradient corner to corner; on paper
+     the documented angle is the one that ships, so it is used here.
+     `v` is the objectBoundingBox vector [x1, y1, x2, y2]; `ink` is the family's
+     text-safe darkening from §07, for type that has to sit beside the field. */
+  const FAM = [
+    { name: 'Red',       a: '#A02337', b: '#861C2C', v: [0, 0, 1, 0], css: '90deg',  ink: '#A02337' },
+    { name: 'Tangerine', a: '#F2A03B', b: '#E14729', v: [0, 1, 1, 0], css: '45deg',  ink: '#B8390F' },
+    { name: 'Olive',     a: '#C2C684', b: '#A8B468', v: [0, 0, 1, 1], css: '135deg', ink: '#5F6733' },
+    { name: 'Ocean',     a: '#54ABBB', b: '#3A8FA3', v: [0, 0, 0, 1], css: '180deg', ink: '#2C7183' },
+  ];
+
+  /* The dark registers.
+
+     dark: the four families relit for a dark ground, exactly the values §14
+     gives the Dark theme. Same hues, raised in value and softened in
+     saturation, and both stops of every family clear 4.5:1 on the stock, which
+     is why they double as the text colours and need no separate ink variants.
+     gold: the four values §07 already specifies for Dark Mono Gold. A single
+     plate cannot carry a family gradient (§02), so those four are depths of
+     one metal rather than four hues. */
+  const DARK = [
+    { a: '#F2778C', b: '#DB5670', v: [0, 0, 1, 0], css: '90deg',  ink: '#F2778C' },   /* Red       */
+    { a: '#F5A85A', b: '#EE8340', v: [0, 1, 1, 0], css: '45deg',  ink: '#F5A85A' },   /* Tangerine */
+    { a: '#C9CE8C', b: '#ADB878', v: [0, 0, 1, 1], css: '135deg', ink: '#C9CE8C' },   /* Olive     */
+    { a: '#7FC9D8', b: '#58A9BC', v: [0, 0, 0, 1], css: '180deg', ink: '#7FC9D8' },   /* Ocean     */
+  ];
+  const GOLD = [
+    { a: '#F0D08A', b: '#C9A227', v: [0, 0, 1, 0], css: '90deg',  ink: '#F0D08A' },   /* Gold      */
+    { a: '#C9A227', b: '#96741A', v: [0, 1, 1, 0], css: '45deg',  ink: '#C9A227' },   /* Antique   */
+    { a: '#F7E3B5', b: '#E0C878', v: [0, 0, 1, 1], css: '135deg', ink: '#F7E3B5' },   /* Champagne */
+    { a: '#D9B84A', b: '#96741A', v: [0, 0, 0, 1], css: '180deg', ink: '#D9B84A' },   /* Gold Ink  */
+  ];
+  const PALETTE = { brand: FAM, dark: DARK, gold: GOLD };
+
+  const U = 100;   /* lattice unit; the SVG is scaled to millimetres by CSS */
+
+  /* Quarter disc, by rotation. 0 bulges top-left, then clockwise. */
+  const QUARTER = (x, y) => [
+    `M${x + U},${y} A${U},${U} 0 0,0 ${x},${y + U} L${x + U},${y + U} Z`,
+    `M${x},${y} A${U},${U} 0 0,1 ${x + U},${y + U} L${x},${y + U} Z`,
+    `M${x + U},${y} A${U},${U} 0 0,1 ${x},${y + U} L${x},${y} Z`,
+    `M${x + U},${y + U} A${U},${U} 0 0,1 ${x},${y} L${x + U},${y} Z`,
+  ];
+
+  /* ── Pixel type ────────────────────────────────────────────────────────
+     The accent placed deliberately instead of by the die roll: a short text
+     set in Geist Pixel, the lattice standing in for the font's own pixel
+     grid. Geist Pixel is itself built from circles on a fixed grid, which is
+     why it survives the substitution: each of its pixels becomes one cell.
+
+     Returns the set of flat cell indices the text's pixels land on, centred
+     both ways, or null when there is nothing to draw. The font's grid puts
+     row 0 on the baseline with rows positive upward; capitals are 19 cells
+     tall and descenders reach 4 below, so the text only resolves when the
+     lattice is deep enough — which is what the density setting is for. */
+  function pixelCells(str, cols, rows, font) {
+    const F = (window.PIXELFONTS && window.PIXELFONTS[font])
+           || (window.PIXELFONTS && window.PIXELFONTS.dot) || window.PIXELFONT;
+    if (!F || !str) return null;
+    let x = 0, prev = null;
+    const pts = [];
+    for (const ch of str) {
+      const g = F.glyphs[ch] || F.glyphs[ch.toUpperCase()] || F.glyphs[' '];
+      if (!g) continue;
+      if (prev !== null && F.kern[prev + ch]) x += F.kern[prev + ch];
+      for (const c of g.c) pts.push([x + c[0], c[1]]);
+      x += g.a; prev = ch;
+    }
+    if (!pts.length) return null;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const p of pts) {
+      if (p[0] < minX) minX = p[0]; if (p[0] > maxX) maxX = p[0];
+      if (p[1] < minY) minY = p[1]; if (p[1] > maxY) maxY = p[1];
+    }
+    /* One cell in from the top-left, whatever the face: the knife lands on
+       the outermost row and column, so text starting at (1,1) reads flush
+       against the cut without ever being trimmed by it. */
+    const offX = 1;
+    const offY = 1;
+    const set = new Set();
+    for (const p of pts) {
+      const gx = offX + (p[0] - minX), gy = offY + (maxY - p[1]);
+      if (gx >= 0 && gx < cols && gy >= 0 && gy < rows) set.add(gy * cols + gx);
+    }
+    return set.size ? set : null;
+  }
+
+  /* `lead` overrides the family the hash would have chosen. The accent is
+     always nudged off the lead so the two never collapse into one colour.
+     `pixel`, when given, is a set of flat indices that take the accent; the
+     die roll for the accent is still thrown for every cell so the layout
+     stream stays in lockstep with the hashed version of the same field.
+     `outline` is {mode: 'lead'|'accent'|'both', w: inner stroke in lattice
+     units} and turns that role's cells into rings instead of fills. */
+  function field(text, cols, rows, idp, lead, pal, accent, over, pixel, outline) {
+    const P = PALETTE[pal] || FAM;
+    const s = cyrb128(text);
+    const rnd = sfc32(s[0], s[1], s[2], s[3]);
+    if (lead === null || lead === undefined) lead = s[0] % 4;
+    /* A derived accent is nudged off the lead so the field always has two
+       tones. An accent chosen deliberately is left alone, including when it
+       matches the lead, which is how a single-family field is asked for. */
+    if (accent === null || accent === undefined) {
+      accent = s[1] % 4; if (accent === lead) accent = (lead + 1) % 4;
+    }
+
+    const parts = [], cells = [];
+    for (let i = 0; i < cols * rows; i++) {
+      /* Three draws per cell, in this order, so the stream matches the Lab.
+         They are taken for every cell whether or not it carries an override,
+         so overriding one cell never shifts the cells after it. */
+      const roll = rnd(), famRoll = rnd(), rotRoll = rnd();
+      let f = pixel ? (pixel.has(i) ? accent : lead)
+                    : (famRoll < 0.12 ? accent : lead);
+      let t = roll < 0.50 ? 'quarter'
+            : roll < 0.66 ? 'split'
+            : roll < 0.78 ? 'circle'
+            : roll < 0.88 ? 'square' : 'empty';
+      let rot = (rotRoll * 4) | 0;
+      /* A pixel of the text keeps only the shapes that cover their whole
+         cell — a quarter bites half the cell out of a stroke and an empty
+         punches a hole through it, so both fall back to the circle, the
+         shape Geist Pixel builds its glyphs from. The ground keeps the
+         documented shares, exactly as a hashed field would draw them. */
+      if (pixel && pixel.has(i) && (t === 'quarter' || t === 'empty')) t = 'circle';
+
+      const o = over && over[i];
+      if (o) {
+        if (o.t) t = o.t;
+        if (o.rot !== undefined && o.rot !== null) rot = o.rot;
+        if (o.fam !== undefined && o.fam !== null) f = o.fam;
+      }
+      cells.push({ t, rot, fam: f, custom: !!o });
+
+      const x = (i % cols) * U, y = ((i / cols) | 0) * U;
+      const g = `url(#${idp}${f})`;
+
+      /* Whether this cell draws filled or as a ring. The outline option works
+         on roles, not colours: the accent role is the text in pixel type and
+         the one-in-eight cells otherwise, so it survives lead and accent
+         being set to the same family. SVG has no inner stroke, so a ring is
+         the shape stroked at double weight and clipped to itself — the half
+         that falls outside is cut away, which leaves exactly the asked-for
+         weight inside the edge, and it survives print and Illustrator as
+         plain vector. */
+      const roleAccent = pixel ? pixel.has(i)
+                       : (accent === lead ? famRoll < 0.12 : f === accent);
+      const ringed = outline && (outline.mode === 'both'
+                  || (outline.mode === 'accent' ? roleAccent : !roleAccent));
+      const put = (shape, paint, sub) => {
+        if (!ringed) { parts.push(shape.replace('%A%', `fill="${paint}"`)); return; }
+        const cid = `${idp}o${i}${sub || ''}`;
+        parts.push(
+          `<clipPath id="${cid}">${shape.replace('%A%', '')}</clipPath>`,
+          shape.replace('%A%', `fill="none" stroke="${paint}" ` +
+            `stroke-width="${outline.w * 2}" clip-path="url(#${cid})"`));
+      };
+
+      if (t === 'quarter')    put(`<path d="${QUARTER(x, y)[rot & 3]}" %A%/>`, g);
+      else if (t === 'split') {
+        /* A ringed split would draw two triangle rings and a doubled
+           diagonal; as an outline it reads as a plain square instead. */
+        if (ringed) put(`<rect x="${x}" y="${y}" width="${U}" height="${U}" %A%/>`, g);
+        else {
+          put(`<path d="M${x},${y} L${x + U},${y} L${x},${y + U} Z" %A%/>`, P[f].a, 'a');
+          put(`<path d="M${x + U},${y} L${x + U},${y + U} L${x},${y + U} Z" %A%/>`, P[f].b, 'b');
+        }
+      }
+      else if (t === 'circle') put(`<circle cx="${x + U / 2}" cy="${y + U / 2}" r="${U / 2}" %A%/>`, g);
+      else if (t === 'square') put(`<rect x="${x}" y="${y}" width="${U}" height="${U}" %A%/>`, g);
+      /* 'empty' draws nothing, and the stock shows through */
+    }
+
+    const defs = P.map((f, n) =>
+      `<linearGradient id="${idp}${n}" x1="${f.v[0]}" y1="${f.v[1]}" x2="${f.v[2]}" y2="${f.v[3]}">` +
+      `<stop offset="0" stop-color="${f.a}"/><stop offset="1" stop-color="${f.b}"/></linearGradient>`).join('');
+
+    return {
+      svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${cols * U} ${rows * U}" ` +
+           `preserveAspectRatio="none" aria-hidden="true"><defs>${defs}</defs>${parts.join('')}</svg>`,
+      tag: s[0].toString(16).padStart(8, '0').toUpperCase(),
+      lead, accent, cells,
+    };
+  }
+
+  /* Repaint one field from its own data attributes. Called on load and on
+     every keystroke in the name it is bound to. */
+  const seen = new Map();
+  function paint(host, over) {
+    if (!seen.has(host)) seen.set(host, `h${seen.size}f`);
+    const idp = seen.get(host);
+    const num = v => (v === '' || v === undefined) ? null : parseInt(v, 10);
+    const lead = num(host.dataset.hashLead);
+    const accent = num(host.dataset.hashAccent);
+    const pal = host.dataset.hashPalette || 'brand';
+    const P = PALETTE[pal] || FAM;
+    /* Density subdivides the piece's own lattice rather than changing its
+       geometry: at density d every documented cell becomes d × d cells, so
+       the field keeps its size and proportions and gains resolution. It
+       applies to hashed and pixel fields alike; the declared cols/rows stay
+       the canonical 1× values. */
+    const d = Math.min(3, Math.max(1, parseInt(host.dataset.hashDensity, 10) || 1));
+    const cols = (parseInt(host.dataset.hashCols, 10) || 17) * d;
+    const rows = (parseInt(host.dataset.hashRows, 10) || 7) * d;
+    const ptext = (host.dataset.hashPixel || '').trim();
+    const pixel = ptext ? pixelCells(ptext, cols, rows, host.dataset.hashPixelFont) : null;
+    /* The stroke is asked for in millimetres of the printed piece; the
+       piece's own --cell says how many millimetres one documented cell is,
+       and density divides that down to the drawn subcell. */
+    let outline = null;
+    if (host.dataset.hashOutline) {
+      const mm = parseFloat(host.dataset.hashStrokeMm) || 0.8;
+      const cellMM = parseFloat(getComputedStyle(host).getPropertyValue('--cell')) || 6;
+      outline = { mode: host.dataset.hashOutline, w: Math.max(2, U * mm * d / cellMM) };
+    }
+    const res = field(
+      host.dataset.hash || ' ',
+      cols, rows,
+      idp, lead, pal, accent, over, pixel, outline);
+    host.innerHTML = res.svg;
+    host.dataset.hashTagValue = res.tag;
+    /* Type that has to hold its own beside the field follows the lead family
+       into its text-safe darkening, never the flat family value. */
+    document.querySelectorAll(`[data-hash-ink="${host.id}"]`)
+      .forEach(el => el.style.color = P[res.lead].ink);
+    /* A flat band that has to agree with the field takes the lead family's
+       own gradient, at the angle §02 gives it. */
+    document.querySelectorAll(`[data-hash-grad="${host.id}"]`)
+      .forEach(el => el.style.background = `linear-gradient(${P[res.lead].css}, ${P[res.lead].a}, ${P[res.lead].b})`);
+    document.querySelectorAll(`[data-hash-tag="${host.id}"]`)
+      .forEach(el => el.textContent = res.tag);
+    return res;
+  }
+
+  const fields = [...document.querySelectorAll('[data-hash]')];
+  fields.forEach(paint);
+
+  /* ── Live editing ──────────────────────────────────────────────────────
+     The pieces are edited in place rather than through a form: a card is a
+     layout, and typing into the layout is the only way to find out that a
+     long name pushes into the safety margin. */
+  document.querySelectorAll('[data-edit], [data-mirror]').forEach(el => {
+    /* plaintext-only keeps pasted markup out of a piece that gets cloned
+       into the PDF. Where it is unsupported, fall back to plain editing. */
+    el.contentEditable = 'plaintext-only';
+    if (el.contentEditable !== 'plaintext-only') el.contentEditable = 'true';
+    el.spellcheck = false;
+    /* Every field here is a single line; Enter would silently add a second. */
+    el.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); el.blur(); } });
+    el.addEventListener('input', () => {
+      /* The registers show the same person, so a line edited on ANY face
+         flows to the original, to every other register's copy of it, and to
+         any field keyed on it. The edited element itself is left alone, or
+         the caret would jump to the start on every keystroke. */
+      const srcId = el.dataset.mirror || el.id;
+      if (!srcId) return;
+      const text = el.textContent;
+      const src = document.getElementById(srcId);
+      if (src && src !== el) src.textContent = text;
+      document.querySelectorAll(`[data-mirror="${srcId}"]`)
+        .forEach(m => { if (m !== el) m.textContent = text; });
+      fields.filter(f => f.dataset.hashFrom === srcId).forEach(f => {
+        f.dataset.hash = text.trim();
+        paint(f);
+      });
+    });
+  });
+
+  /* ── Family picker ─────────────────────────────────────────────────────
+     Auto means "whatever the name hashed to". Choosing a family overrides
+     only the lead; the layout itself stays keyed to the name.
+
+     `data-fam-pick` takes every field of the piece, light and dark alike, so
+     one control moves all of a piece's registers together. The choice is a
+     family SLOT rather than a literal colour, and each register renders that
+     slot in its own ink: slot 0 is Red on the light card, the relit Red on the
+     dark one, and Gold in the ceremonial register. */
+  document.querySelectorAll('[data-fam-pick]').forEach(bar => {
+    const hosts = bar.dataset.famPick.split(/\s+/)
+      .map(id => document.getElementById(id)).filter(Boolean);
+    if (!hosts.length) return;
+    /* Two bars per piece: one sets the family that leads the field, one sets
+       the family that appears in roughly one cell in eight. */
+    const key = bar.dataset.famRole === 'accent' ? 'hashAccent' : 'hashLead';
+    bar.querySelectorAll('button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        hosts.forEach(host => {
+          if (btn.dataset.fam === 'auto') delete host.dataset[key];
+          else host.dataset[key] = btn.dataset.fam;
+          paint(host);
+        });
+        bar.querySelectorAll('button').forEach(b => {
+          b.classList.toggle('on', b === btn);
+          b.setAttribute('aria-pressed', String(b === btn));
+        });
+      });
+    });
+  });
+
+  /* ── Pixel type controls ───────────────────────────────────────────────
+     One group per card piece, driving every register of the piece together,
+     the same way the family picker does. The group's `data-pixel-for` lists
+     the host ids; inside it live a Hashed / Pixel type toggle, the text that
+     gets set, and the density. Nothing is written to a host until the mode is
+     Pixel, so the cards' canonical hashed fields stay exactly as documented. */
+  document.querySelectorAll('[data-pixel-for]').forEach(ctl => {
+    const hosts = ctl.dataset.pixelFor.split(/\s+/)
+      .map(id => document.getElementById(id)).filter(Boolean);
+    const input = ctl.querySelector('input[data-pixel-text]');
+    if (!hosts.length || !input) return;
+    /* The piece's defaults are whichever buttons the markup marks `on`, so a
+       card whose lattice suits a different face or density declares that in
+       the HTML rather than in code here. */
+    const state = {};
+    const BANKS = ['data-pixel-mode', 'data-pixel-density', 'data-pixel-font'];
+    BANKS.forEach(bank => {
+      const on = ctl.querySelector(`button[${bank}].on`) || ctl.querySelector(`button[${bank}]`);
+      state[bank] = on ? on.getAttribute(bank) : null;
+    });
+
+    const apply = () => {
+      ctl.classList.toggle('is-hashed', state['data-pixel-mode'] !== 'pixel');
+      hosts.forEach(host => {
+        /* Density stands on its own: it re-grains a hashed field too. */
+        host.dataset.hashDensity = state['data-pixel-density'] || '1';
+        if (state['data-pixel-mode'] === 'pixel' && input.value.trim()) {
+          host.dataset.hashPixel = input.value;
+          host.dataset.hashPixelFont = state['data-pixel-font'] || 'dot';
+        } else {
+          delete host.dataset.hashPixel;
+          delete host.dataset.hashPixelFont;
+        }
+        paint(host);
+      });
+    };
+
+    ctl.querySelectorAll(BANKS.map(b => `button[${b}]`).join(', '))
+      .forEach(btn => btn.addEventListener('click', () => {
+        const bank = BANKS.find(b => btn.hasAttribute(b));
+        state[bank] = btn.getAttribute(bank);
+        ctl.querySelectorAll(`button[${bank}]`).forEach(b => {
+          const on = b === btn;
+          b.classList.toggle('on', on);
+          b.setAttribute('aria-pressed', String(on));
+        });
+        apply();
+      }));
+
+    input.addEventListener('input', apply);
+  });
+
+  /* ── Outline controls ──────────────────────────────────────────────────
+     Same shape as the pixel group: one per piece, all registers together.
+     Filled is the documented default; the other three settings turn the
+     chosen role's cells into inner-stroked rings at a millimetre weight. */
+  document.querySelectorAll('[data-outline-for]').forEach(ctl => {
+    const hosts = ctl.dataset.outlineFor.split(/\s+/)
+      .map(id => document.getElementById(id)).filter(Boolean);
+    const winput = ctl.querySelector('input[data-outline-w]');
+    if (!hosts.length) return;
+    let mode = (ctl.querySelector('button[data-outline-mode].on')
+             || ctl.querySelector('button[data-outline-mode]')).dataset.outlineMode;
+
+    const apply = () => {
+      hosts.forEach(host => {
+        if (mode && mode !== 'none') {
+          host.dataset.hashOutline = mode;
+          if (winput) host.dataset.hashStrokeMm = winput.value;
+        } else {
+          delete host.dataset.hashOutline;
+          delete host.dataset.hashStrokeMm;
+        }
+        paint(host);
+      });
+    };
+
+    ctl.querySelectorAll('button[data-outline-mode]').forEach(btn =>
+      btn.addEventListener('click', () => {
+        mode = btn.dataset.outlineMode;
+        ctl.querySelectorAll('button[data-outline-mode]').forEach(b => {
+          const on = b === btn;
+          b.classList.toggle('on', on);
+          b.setAttribute('aria-pressed', String(on));
+        });
+        apply();
+      }));
+    if (winput) winput.addEventListener('input', apply);
+  });
+
+  /* cyrb128 and sfc32 are exported for OTHER generators (the Info Day card)
+     that need the same deterministic stream; the functions themselves stay
+     parity-locked and unedited. */
+  window.CellHash = { FAM, field, paint, pixelCells, QUARTER, U, cyrb128, sfc32 };
+})();

@@ -1,0 +1,287 @@
+/* The card, held in the hand.
+
+   A physically based render of the generated card: ID-1 corner radius, a
+   coated-stock finish (clearcoat over a matte face), image-based lighting
+   from a neutral room, ACES tone mapping and a soft contact shadow behind
+   it. The card leans gently toward the pointer.
+
+   The artwork itself stays the generator's SVG: it is rasterised to a
+   texture on every change, so the 3D card and the saved PNG are always
+   the same picture. If WebGL is unavailable the flat SVG stays, and
+   `#flat` in the URL forces it (used by the layout checks). */
+import * as THREE from 'three';
+import { RoomEnvironment } from './vendor/RoomEnvironment.js';
+
+(() => {
+  'use strict';
+  if (location.hash.includes('flat')) return;
+
+  const stage = document.getElementById('card-stage');
+  if (!stage || !window.InfoDayCard) return;
+
+  const { W, H, COLS, ROWS, FIELD } = window.InfoDayCard.mm;   /* 86 x 54 */
+  const R = 3.18, DEPTH = 0.76;                /* ID-1 corner, card stock */
+
+  let renderer;
+  try {
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  } catch (e) { return; }
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.shadowMap.enabled = true;
+  /* VSM honours shadow.radius; PCFSoft silently ignores it */
+  renderer.shadowMap.type = THREE.VSMShadowMap;
+  /* Neutral keeps the brand colours honest; ACES washes saturated ink */
+  renderer.toneMapping = THREE.NeutralToneMapping;
+  renderer.toneMappingExposure = 1.0;
+  stage.classList.add('is-3d');
+  stage.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(26, 620 / 400, 10, 1200);
+  camera.position.set(0, 0, 205);
+
+  /* the room is the light: image-based, so the coat has something to mirror */
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+  const key = new THREE.DirectionalLight(0xffffff, 0.95);
+  key.position.set(70, 110, 160);
+  key.castShadow = true;
+  key.shadow.mapSize.set(1024, 1024);
+  key.shadow.radius = 22;
+  key.shadow.blurSamples = 18;
+  key.shadow.bias = -0.0002;
+  const d = 90;
+  key.shadow.camera.left = -d; key.shadow.camera.right = d;
+  key.shadow.camera.top = d; key.shadow.camera.bottom = -d;
+  key.shadow.camera.far = 500;
+  scene.add(key);
+
+  /* the card: rounded rectangle, thin extrusion, tiny bevel for the edge
+     highlight. Drawn centred so it rotates about its middle. */
+  const shape = new THREE.Shape();
+  const w2 = W / 2, h2 = H / 2;
+  shape.moveTo(-w2 + R, -h2);
+  shape.lineTo(w2 - R, -h2);  shape.absarc(w2 - R, -h2 + R, R, -Math.PI / 2, 0);
+  shape.lineTo(w2, h2 - R);   shape.absarc(w2 - R, h2 - R, R, 0, Math.PI / 2);
+  shape.lineTo(-w2 + R, h2);  shape.absarc(-w2 + R, h2 - R, R, Math.PI / 2, Math.PI);
+  shape.lineTo(-w2, -h2 + R); shape.absarc(-w2 + R, -h2 + R, R, Math.PI, Math.PI * 1.5);
+
+  const geo = new THREE.ExtrudeGeometry(shape, {
+    depth: DEPTH, curveSegments: 24,
+    bevelEnabled: true, bevelThickness: 0.12, bevelSize: 0.12, bevelSegments: 2,
+  });
+  geo.center();
+  /* the caps' UVs come out in shape millimetres; remap them to 0..1 */
+  {
+    const uv = geo.attributes.uv, pos = geo.attributes.position;
+    const g0 = geo.groups.find(g => g.materialIndex === 0);
+    const idx = geo.index;
+    const seen = new Set();
+    for (let i = g0.start; i < g0.start + g0.count; i++) {
+      const v = idx ? idx.getX(i) : i;
+      if (seen.has(v)) continue;
+      seen.add(v);
+      uv.setXY(v, (pos.getX(v) + w2) / W, (pos.getY(v) + h2) / H);
+    }
+    uv.needsUpdate = true;
+  }
+
+  const face = new THREE.MeshPhysicalMaterial({
+    color: 0xffffff, metalness: 0, roughness: 0.4,
+    clearcoat: 1, clearcoatRoughness: 0.14, envMapIntensity: 0.45,
+  });
+  const edge = new THREE.MeshPhysicalMaterial({
+    color: 0xF2F1EE, metalness: 0, roughness: 0.6, envMapIntensity: 0.4,
+  });
+  const card = new THREE.Mesh(geo, [face, edge]);
+  card.castShadow = true;
+  scene.add(card);
+
+  /* soft contact shadow on an invisible wall behind the card */
+  const wall = new THREE.Mesh(
+    new THREE.PlaneGeometry(600, 400),
+    new THREE.ShadowMaterial({ opacity: 0.22 }));
+  wall.position.z = -16;
+  wall.receiveShadow = true;
+  scene.add(wall);
+
+  /* ── the artwork as a texture, refreshed whenever the card changes ────── */
+  const TEXW = 1800, TEXH = Math.round(TEXW * H / W);   /* the card's own aspect */
+  const cnv = document.createElement('canvas');
+  cnv.width = TEXW; cnv.height = TEXH;
+  const ctx = cnv.getContext('2d');
+  const tex = new THREE.CanvasTexture(cnv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  face.map = tex;
+
+  const STILL = location.hash.includes('still');   /* render per event, for checks */
+
+  /* ── regeneration: only the FIELD wipes. The band below swaps at once,
+     so every change answers immediately; the old shapes then tear away
+     cell by cell, top-left to bottom-right, and the new ones sweep in the
+     same way. A watchdog lands the final image even if animation frames
+     stall, and an interrupted transition completes before the next one
+     starts, so rapid toggling always makes forward progress. ── */
+  const GC = COLS, FR = ROWS;                      /* the field's grid */
+  const FIELD_H = Math.round(TEXH * FIELD / H);    /* field: the top FIELD mm */
+  const CW = TEXW / GC, CH2 = FIELD_H / FR;
+  const OUT_MS = 280, IN_MS = 300;
+  let anim = null, firstDraw = true;
+
+  function drawFull(img) {
+    ctx.clearRect(0, 0, TEXW, TEXH);
+    ctx.drawImage(img, 0, 0, TEXW, TEXH);
+    tex.needsUpdate = true;
+  }
+
+  function finishAnim() {
+    if (!anim) return;
+    cancelAnimationFrame(anim.raf);
+    clearTimeout(anim.guard);
+    drawFull(anim.img);
+    anim = null;
+  }
+
+  function fieldCellsInDiagonalOrder() {
+    const cells = [];
+    for (let r = 0; r < FR; r++)
+      for (let c = 0; c < GC; c++)
+        cells.push({ c, r, k: c + r + Math.random() * 1.4 });
+    cells.sort((a, b) => a.k - b.k);
+    return cells;
+  }
+
+  function startTransition(newImg) {
+    finishAnim();                              /* the last change lands first */
+    const nW = newImg.naturalWidth || 340, nH = newImg.naturalHeight || 204;
+    const sx = nW / TEXW, sy = nH / TEXH;
+    /* the band answers immediately */
+    ctx.drawImage(newImg, 0, FIELD_H * sy, nW, nH - FIELD_H * sy,
+                  0, FIELD_H, TEXW, TEXH - FIELD_H);
+    tex.needsUpdate = true;
+    /* the incoming ground, from the true corner pixel */
+    const s1 = document.createElement('canvas'); s1.width = s1.height = 1;
+    const sctx = s1.getContext('2d');
+    sctx.drawImage(newImg, 1, 1, 1, 1, 0, 0, 1, 1);
+    const d = sctx.getImageData(0, 0, 1, 1).data;
+    const ground = `rgb(${d[0]},${d[1]},${d[2]})`;
+    const outCells = fieldCellsInDiagonalOrder();
+    const inCells = fieldCellsInDiagonalOrder();
+    const t0 = performance.now();
+    const step = now => {
+      if (!anim || anim.img !== newImg) return;
+      const t = now - t0;
+      if (t < OUT_MS) {
+        const n = Math.floor(outCells.length * (t / OUT_MS));
+        ctx.fillStyle = ground;
+        for (let i = 0; i < n; i++) {
+          const q = outCells[i];
+          ctx.fillRect(q.c * CW - 0.5, q.r * CH2 - 0.5, CW + 1, CH2 + 1);
+        }
+        /* the frontier tears sideways for a beat before it goes */
+        for (let i = n; i < Math.min(n + 5, outCells.length); i++) {
+          const q = outCells[i], x = q.c * CW, y = q.r * CH2;
+          const dx = (Math.random() * 14 - 7) | 0;
+          const band = CH2 * (0.25 + Math.random() * 0.4);
+          const by = Math.min(y + Math.random() * (CH2 - band), FIELD_H - band);
+          ctx.drawImage(cnv, x, by, CW, band, x + dx, by, CW, band);
+        }
+      } else if (t < OUT_MS + IN_MS) {
+        const n = Math.floor(inCells.length * ((t - OUT_MS) / IN_MS));
+        ctx.fillStyle = ground;
+        ctx.fillRect(0, 0, TEXW, FIELD_H);
+        for (let i = 0; i < n; i++) {
+          const q = inCells[i], x = q.c * CW, y = q.r * CH2;
+          ctx.drawImage(newImg, x * sx, y * sy, CW * sx, CH2 * sy, x, y, CW, CH2);
+        }
+        /* the frontier arrives with the same tear, then settles */
+        for (let i = n; i < Math.min(n + 5, inCells.length); i++) {
+          const q = inCells[i], x = q.c * CW, y = q.r * CH2;
+          const dx = (Math.random() * 14 - 7) | 0;
+          ctx.drawImage(newImg, x * sx, y * sy, CW * sx, CH2 * sy, x + dx, y, CW, CH2);
+        }
+      } else {
+        drawFull(newImg);
+        clearTimeout(anim.guard);
+        anim = null;
+        return;
+      }
+      tex.needsUpdate = true;
+      anim.raf = requestAnimationFrame(step);
+    };
+    anim = {
+      img: newImg,
+      raf: requestAnimationFrame(step),
+      guard: setTimeout(finishAnim, OUT_MS + IN_MS + 300),
+    };
+  }
+
+  let timer = null;
+  function refresh() {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      const svg = window.InfoDayCard.svg();
+      if (!svg) return;
+      const img = new Image();
+      const url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        if (STILL || firstDraw) {
+          firstDraw = false;
+          drawFull(img);
+          if (STILL) renderer.render(scene, camera);
+          return;
+        }
+        startTransition(img);
+      };
+      img.src = url;
+    }, 90);
+  }
+  /* a fingerprint of the texture canvas, for the layout checks */
+  window.InfoDay3D = {
+    snap: () => { let h = 0; const d = ctx.getImageData(0, 0, 64, 64).data; for (let i = 0; i < d.length; i += 97) h = (h * 31 + d[i]) | 0; return h; },
+    /* render one frame NOW and fingerprint what the GPU drew */
+    shot: () => { renderer.render(scene, camera); const u = renderer.domElement.toDataURL('image/png'); let h = 0; for (let i = 0; i < u.length; i += 31) h = (h * 33 + u.charCodeAt(i)) | 0; return { h, len: u.length }; },
+  };
+    document.addEventListener('if-cardchange', refresh);
+  refresh();
+
+  /* ── the lean: toward the pointer, and a slow breath when it leaves ───── */
+  let tx = 0, ty = 0, hasPointer = false;
+  /* the whole page steers the card; angles still measured from the stage */
+  document.addEventListener('pointermove', e => {
+    const r = stage.getBoundingClientRect();
+    const nx = Math.max(-1.15, Math.min(1.15, ((e.clientX - r.left) / r.width) * 2 - 1));
+    const ny = Math.max(-1.15, Math.min(1.15, ((e.clientY - r.top) / r.height) * 2 - 1));
+    hasPointer = true;
+    ty = nx * 0.16; tx = ny * 0.12;
+  });
+  document.documentElement.addEventListener('mouseleave', () => { hasPointer = false; });
+
+  function size() {
+    const w = stage.clientWidth || 620;
+    const h = Math.round(w * 400 / 620);
+    renderer.setSize(w, h, false);
+    renderer.domElement.style.height = h + 'px';
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
+  new ResizeObserver(size).observe(stage);
+  size();
+
+  const clock = new THREE.Clock();
+  (function frame() {
+    if (!STILL) requestAnimationFrame(frame);
+    const t = clock.getElapsedTime();
+    if (!hasPointer) {
+      ty = Math.sin(t * 0.5) * 0.05;
+      tx = Math.cos(t * 0.4) * 0.035;
+    }
+    card.rotation.y += (ty - card.rotation.y) * 0.07;
+    card.rotation.x += (tx - card.rotation.x) * 0.07;
+    card.position.y = Math.sin(t * 0.8) * 0.6;
+    renderer.render(scene, camera);
+  })();
+})();
